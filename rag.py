@@ -261,9 +261,23 @@ async def load_or_build_index(
         and npz_path.is_file()
     ):
         try:
-            loaded = np.load(npz_path)
-            vectors = loaded["vectors"]
-            ids = [str(x) for x in loaded["ids"].tolist()]
+            try:
+                with np.load(npz_path, allow_pickle=False) as loaded:
+                    vectors = loaded["vectors"]
+                    ids = [str(x) for x in loaded["ids"].tolist()]
+            except ValueError as e:
+                # Миграция legacy-кэша: раньше ids сохранялись как object.
+                if "Object arrays cannot be loaded when allow_pickle=False" not in str(e):
+                    raise
+                logger.info("RAG: найден legacy-кэш, выполняю миграцию формата ids")
+                with np.load(npz_path, allow_pickle=True) as legacy:
+                    vectors = legacy["vectors"]
+                    ids = [str(x) for x in legacy["ids"].tolist()]
+                np.savez_compressed(
+                    npz_path,
+                    vectors=vectors.astype(np.float32),
+                    ids=np.asarray(ids, dtype=np.str_),
+                )
             if ids == [c.chunk_id for c in chunks]:
                 logger.info("RAG: загружен кэш эмбеддингов (%s чанков)", len(chunks))
                 return RAGIndex(chunks, vectors)
@@ -277,7 +291,11 @@ async def load_or_build_index(
         raise ValueError("Число векторов от Ollama не совпадает с числом чанков")
 
     vectors = np.array(embeddings, dtype=np.float32)
-    np.savez_compressed(npz_path, vectors=vectors, ids=np.array([c.chunk_id for c in chunks], dtype=object))
+    np.savez_compressed(
+        npz_path,
+        vectors=vectors,
+        ids=np.asarray([c.chunk_id for c in chunks], dtype=np.str_),
+    )
     _save_meta(
         meta_path,
         {
