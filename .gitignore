@@ -1,0 +1,52 @@
+# Секреты и локальная конфигурация
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Виртуальные окружения
+.venv/
+venv/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# RAG-кэш Ollama (пересчитывается при старте)
+*.rag_meta.json
+*.rag_vectors.npz
+
+# Runtime-надстройки админа (учатся из бота)
+data/college_ai_knowledge/_runtime_overrides.json
+
+# Легаси JSON базы (проект на markdown)
+data/knowlege.json
+
+# Логи
+*.log
