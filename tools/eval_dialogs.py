@@ -37,6 +37,24 @@ def _load_rows(path: Path) -> list[EvalRow]:
     return rows
 
 
+def _write_sample(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sample = [
+        {
+            "user": "где посмотреть оценки",
+            "bot": "Оценки смотри в SmartNation: логин — ИИН, пароль — последние 6 цифр ИИН + abc.",
+            "expected_keywords": ["smartnation", "иин"],
+        },
+        {
+            "user": "как исправить оценку",
+            "bot": "По материалам колледжа: по изменению оценки лучше сразу подойти к преподавателю.",
+            "expected_keywords": ["преподавател"],
+        },
+    ]
+    body = "\n".join(json.dumps(row, ensure_ascii=False) for row in sample) + "\n"
+    path.write_text(body, encoding="utf-8")
+
+
 def _is_listy_answer(bot: str) -> bool:
     return bool(re.search(r"(^|\s)(1[\)\.]|2[\)\.])\s", bot))
 
@@ -79,9 +97,28 @@ def evaluate(rows: list[EvalRow]) -> dict[str, float]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Путь до jsonl с тест-кейсами")
+    parser.add_argument("--input", help="Путь до jsonl с тест-кейсами")
+    parser.add_argument(
+        "--create-sample",
+        help="Создать sample jsonl по указанному пути и выйти",
+    )
     args = parser.parse_args()
-    rows = _load_rows(Path(args.input))
+    if args.create_sample:
+        out = Path(args.create_sample)
+        _write_sample(out)
+        print(f"Sample-файл создан: {out}")
+        return
+    if not args.input:
+        raise SystemExit(
+            "Укажи --input <путь к jsonl> или --create-sample <куда создать sample>."
+        )
+    input_path = Path(args.input)
+    if not input_path.is_file():
+        raise SystemExit(
+            f"Файл не найден: {input_path}\n"
+            f"Создай sample командой: python tools/eval_dialogs.py --create-sample tools/cases.sample.jsonl"
+        )
+    rows = _load_rows(input_path)
     metrics = evaluate(rows)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
