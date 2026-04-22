@@ -45,6 +45,12 @@ TOPIC_MAP = {
     "колледж": "колледж",
 }
 GREETING_WORDS = {"привет", "здравствуйте", "салам", "добрый день", "добрый вечер", "хай"}
+REPEAT_REMINDER_VARIANTS = (
+    "Мы это уже обсудили. Я не попугай, давай двигаться дальше по делу.",
+    "Понимаю, вопрос повторяется. Не дублируй много раз одно и то же — так отвечу точнее.",
+    "Этот вопрос уже был. Я помню контекст, лучше уточни деталь, а не повторяй дословно.",
+    "Я уже отвечал на это. Давай без кругов: добавь, что именно осталось непонятно.",
+)
 RUNTIME_OVERRIDES_FILE = "_runtime_overrides.json"
 BOT_META_PATTERNS = (
     "как тебя зовут",
@@ -406,6 +412,35 @@ def _is_non_college_math(text: str) -> bool:
     return False
 
 
+def _remember_user_message(state: dict, text: str, max_items: int = 4) -> None:
+    history = state.get("recent_user_messages", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(text)
+    if len(history) > max_items:
+        history = history[-max_items:]
+    state["recent_user_messages"] = history
+
+
+def _get_recent_user_context(state: dict, limit: int = 3) -> list[str]:
+    history = state.get("recent_user_messages", [])
+    if not isinstance(history, list) or len(history) <= 1:
+        return []
+    # Последний элемент — текущее сообщение, берём только предыдущие.
+    prev = [str(x).strip() for x in history[:-1] if str(x).strip()]
+    if not prev:
+        return []
+    return prev[-limit:]
+
+
+def _repeat_reminder_prefix(state: dict) -> str:
+    idx_raw = state.get("repeat_notice_idx", 0)
+    idx = int(idx_raw) if isinstance(idx_raw, (int, str)) else 0
+    idx = idx % len(REPEAT_REMINDER_VARIANTS)
+    state["repeat_notice_idx"] = (idx + 1) % len(REPEAT_REMINDER_VARIANTS)
+    return REPEAT_REMINDER_VARIANTS[idx]
+
+
 def _get_dialog_state(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> dict:
     states = context.bot_data.setdefault("dialog_states", {})
     if user_id is None:
@@ -419,6 +454,8 @@ def _get_dialog_state(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -
             "last_bot_answer": "",
             "suggested_topic": "",
             "recent_questions": [],
+            "recent_user_messages": [],
+            "repeat_notice_idx": 0,
         }
         states[user_id] = state
     return state
@@ -692,6 +729,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = _get_dialog_state(context, user_id)
     normalized_q = _normalize_question(text)
     is_repeat_question = normalized_q and normalized_q in state.get("recent_questions", [])
+    _remember_user_message(state, text, max_items=4)
+    recent_user_context = _get_recent_user_context(state, limit=3)
 
     if _is_admin(update, context) and context.bot_data.get("admin_learn_mode", False):
         data: dict = context.bot_data["knowledge"]
@@ -731,7 +770,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     direct = _direct_college_reply(text, context.bot_data.get("knowledge", {}))
     if direct:
         if is_repeat_question:
-            direct = f"Вы уже задавали этот вопрос ранее. {direct}"
+            prefix = _repeat_reminder_prefix(state)
+            if prefix.lower() not in direct.lower():
+                direct = f"{prefix} {direct}"
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
@@ -778,6 +819,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     qa_examples = context.bot_data.get("qa_examples", [])
     topic_hint = _extract_topic_hint(text)
     query_for_pipeline = text
+    history_prefix = ""
+    if recent_user_context and (
+        len(text.split()) <= 12 or state.get("awaiting_clarification", False) or is_repeat_question
+    ):
+        history_lines = "\n".join(f"- {msg}" for msg in recent_user_context)
+        history_prefix = (
+            "Недавние сообщения пользователя (для контекста, без выдумок):\n"
+            f"{history_lines}"
+        )
 
     # Уточнение «туда войти» после ответа про SmartNation — в эмбеддинг явно добавит pipeline
     lb = str(state.get("last_bot_answer", "")).lower()
@@ -817,6 +867,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         query_for_pipeline = f"{prev_q}. Уточнение студента: {text}."
         state["awaiting_clarification"] = False
 
+    if history_prefix:
+        query_for_pipeline = (
+            f"{history_prefix}\n\n"
+            f"Текущее сообщение:\n{query_for_pipeline}\n\n"
+            "Учитывай историю только для связи контекста."
+        )
+
     await update.message.chat.send_action(action="typing")
     if rag is None:
         answer = (
@@ -848,8 +905,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except httpx.HTTPStatusError as e:
             answer = (
                 f"Ошибка Ollama (HTTP {e.response.status_code}). "
-                "Проверьте модели в OLLAMA_MODEL_QUICK / OLLAMA_MODEL_EXPLAIN / "
-                "OLLAMA_MODEL_COMPLEX / OLLAMA_REVIEW_MODEL и OLLAMA_EMBED_MODEL."
+                "Проверьте OLLAMA_MODEL_UNIFIED и OLLAMA_EMBED_MODEL в .env."
             )
             logger.warning("ollama http error: %s", e.response.text[:500])
         except Exception as e:
@@ -888,9 +944,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     state["last_user_question"] = text
     if is_repeat_question:
-        reminder = "Вы уже задавали этот вопрос ранее."
-        if reminder.lower() not in answer.lower():
-            answer = f"{reminder} {answer}"
+        prefix = _repeat_reminder_prefix(state)
+        if prefix.lower() not in answer.lower():
+            answer = f"{prefix} {answer}"
+    else:
+        state["repeat_notice_idx"] = 0
     state["last_bot_answer"] = answer
     recent = state.get("recent_questions", [])
     if normalized_q:
@@ -924,12 +982,12 @@ def main() -> None:
 
     data = load_knowledge(knowledge_path)
     ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    # Базовая совместимость: если задан только OLLAMA_MODEL, используем его как дефолт.
-    legacy_model = os.environ.get("OLLAMA_MODEL", "llama3.2")
-    ollama_model_quick = os.environ.get("OLLAMA_MODEL_QUICK", "phi3").strip() or "phi3"
-    ollama_model_explain = os.environ.get("OLLAMA_MODEL_EXPLAIN", "mistral").strip() or "mistral"
-    ollama_model_complex = os.environ.get("OLLAMA_MODEL_COMPLEX", "llama3").strip() or "llama3"
-    ollama_review_model = os.environ.get("OLLAMA_REVIEW_MODEL", legacy_model).strip() or legacy_model
+    # Временный единый режим: одна модель для всех этапов.
+    unified_model = os.environ.get("OLLAMA_MODEL_UNIFIED", "mistral").strip() or "mistral"
+    ollama_model_quick = unified_model
+    ollama_model_explain = unified_model
+    ollama_model_complex = unified_model
+    ollama_review_model = unified_model
     ollama_embed = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
     try:
