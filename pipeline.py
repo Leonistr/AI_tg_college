@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from rag import RAGIndex, ollama_embed_batch
+from rag import KnowledgeChunk, RAGIndex, ollama_embed_batch
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,8 @@ SYSTEM_ANSWER = """Ты молодой преподаватель/куратор
 - Обычно 60-170 символов, 1-3 коротких предложения.
 - Для сложного вопроса максимум 300-400 символов.
 - Если вопрос про объяснение темы: сначала простое объяснение, потом короткий пример, потом где это применяется.
+- Не используй нумерацию вида "1) ... 2) ...", если пользователь сам не просил список.
+- Если это уточнение к прошлому сообщению, отвечай по сути, без пересказа всей истории диалога.
 - Не пиши длинные абзацы и не отвечай одним словом (кроме "да"/"нет" в очевидных случаях)."""
 
 SYSTEM_DECOMPOSE = """Раздели сообщение студента на отдельные простые вопросы.
@@ -88,6 +90,14 @@ MANIPULATION_MARKERS = (
     "взлом",
     "jailbreak",
     "roleplay as",
+)
+SMALLTALK_MARKERS = (
+    "как дела",
+    "чем занимаешься",
+    "как жизнь",
+    "скучно",
+    "расскажи анекдот",
+    "поговори со мной",
 )
 COLLEGE_HINTS = (
     "колледж",
@@ -190,6 +200,7 @@ async def ollama_chat(
     model: str,
     system: str,
     user_text: str,
+    temperature: float | None = None,
     timeout: float = 120.0,
 ) -> str:
     url = f"{base_url.rstrip('/')}/api/chat"
@@ -201,6 +212,8 @@ async def ollama_chat(
         ],
         "stream": False,
     }
+    if temperature is not None:
+        payload["options"] = {"temperature": float(temperature)}
     r = await client.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     data = r.json()
@@ -224,6 +237,8 @@ def _quick_classify_message(text: str) -> ClassificationResult:
         return ClassificationResult(kind="manipulation", reason="abuse")
     if any(h in low for h in COLLEGE_HINTS):
         return ClassificationResult(kind="college_question", reason="college_hint")
+    if any(x in low for x in SMALLTALK_MARKERS):
+        return ClassificationResult(kind="offtopic", reason="smalltalk")
     if re.fullmatch(r"[\d\s\+\-\*/\(\)=\.,]+", t) or re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
         return ClassificationResult(kind="offtopic", reason="math_expression")
     letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", t))
@@ -265,7 +280,7 @@ async def classify_message(
         return quick
     try:
         raw = await ollama_chat(
-            client, base_url, chat_model, SYSTEM_CLASSIFY, message, timeout=25.0
+            client, base_url, chat_model, SYSTEM_CLASSIFY, message, temperature=0.1, timeout=25.0
         )
         parsed = _parse_classification_json(raw)
         if parsed.kind == "unknown":
@@ -397,6 +412,7 @@ async def review_answer(
             model=review_model,
             system=SYSTEM_REVIEW,
             user_text=review_user_text,
+            temperature=0.1,
             timeout=90.0,
         )
         return _parse_review_json(raw)
@@ -421,7 +437,7 @@ async def analyze_user_message(
     else:
         try:
             raw = await ollama_chat(
-                client, base_url, chat_model, SYSTEM_DECOMPOSE, text, timeout=60.0
+                client, base_url, chat_model, SYSTEM_DECOMPOSE, text, temperature=0.2, timeout=60.0
             )
             subquestions = _parse_subquestions(raw, text)
         except Exception:
@@ -436,6 +452,7 @@ async def analyze_user_message(
             chat_model,
             SYSTEM_ANALYZE,
             "Вопросы:\n" + "\n".join(f"- {q}" for q in subquestions),
+            temperature=0.2,
             timeout=40.0,
         )
         topics, has_multi = _parse_topics_json(raw_topics)
@@ -478,6 +495,35 @@ def _queries_for_embedding(user_message: str, subquestions: list[str]) -> list[s
     return list(subquestions)
 
 
+def _wants_full_answer(user_message: str) -> bool:
+    low = user_message.lower()
+    patterns = (
+        r"полн\w*\s+информ",
+        r"подробн\w*",
+        r"максимально\s+подроб",
+        r"все\s+детал",
+        r"все\s+по\s+теме",
+        r"распиши",
+        r"развернут\w*",
+        r"целиком",
+    )
+    return any(re.search(p, low) for p in patterns)
+
+
+def _tokenize_words(text: str) -> set[str]:
+    return set(re.findall(r"[а-яёa-z0-9]{3,}", text.lower()))
+
+
+def _lexical_overlap_score(query: str, fact: str) -> float:
+    q = _tokenize_words(query)
+    if not q:
+        return 0.0
+    f = _tokenize_words(fact)
+    if not f:
+        return 0.0
+    return len(q.intersection(f)) / max(1, len(q))
+
+
 def _pick_best_context_blocks(
     scored_chunks: list[tuple[str, str, str, float]],
     topics: list[str],
@@ -504,7 +550,7 @@ def _pick_best_context_blocks(
     return out
 
 
-def _postprocess_answer(text: str, is_complex: bool) -> str:
+def _postprocess_answer(text: str, is_complex: bool, wants_full_answer: bool = False) -> str:
     # убираем лишние упоминания внутренних терминов
     cleaned = re.sub(r"\b(JSON|json|база знаний|данные)\b", "", text, flags=re.IGNORECASE)
     # схлопываем повторы строк
@@ -520,19 +566,28 @@ def _postprocess_answer(text: str, is_complex: bool) -> str:
     out = " ".join(uniq).strip()
     out = re.sub(r"\s{2,}", " ", out)
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", out) if s.strip()]
-    max_sent = 3
+    max_sent = 8 if wants_full_answer else 3
     if len(sentences) > max_sent:
         sentences = sentences[:max_sent]
     out = " ".join(sentences).strip()
 
     min_len = 45
-    max_len = 400 if is_complex else 150
+    max_len = 1800 if wants_full_answer else (400 if is_complex else 150)
     if len(out) > max_len:
-        out = out[:max_len].rstrip(" ,;:") + "..."
+        clipped = out[:max_len].rstrip()
+        # Режем по ближайшему окончанию предложения, чтобы не оставлять "..."
+        cut_positions = [clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?")]
+        cut = max(cut_positions)
+        if cut >= int(max_len * 0.6):
+            out = clipped[: cut + 1].strip()
+        else:
+            out = clipped.rstrip(" ,;:")
+            if out and out[-1] not in ".!?":
+                out += "."
 
     if len(out.split()) <= 1 and out.lower() not in {"да", "нет"}:
         out = f"{out}. Могу уточнить детали, если нужно."
-    if len(out) < min_len and is_complex and len(sentences) < 2:
+    if len(out) < min_len and is_complex and len(sentences) < 2 and not wants_full_answer:
         out = f"{out} Если нужно, уточните деталь вопроса, и отвечу точнее."
     return out or FALLBACK_NO_MATCH
 
@@ -633,11 +688,18 @@ async def answer_with_rag(
 
     for q, qemb in zip(analysis.subquestions, query_embs, strict=True):
         hits = index.search(qemb, top_k=top_k, min_similarity=min_similarity)
-        if not hits:
+        lexical_hits: list[tuple[KnowledgeChunk, float]] = []
+        for ch in index.chunks:
+            kscore = _lexical_overlap_score(q, ch.fact_text)
+            if kscore >= 0.22:
+                lexical_hits.append((ch, 0.35 + min(0.5, kscore)))
+        lexical_hits.sort(key=lambda x: x[1], reverse=True)
+        combined_hits = list(hits) + lexical_hits[:3]
+        if not combined_hits:
             per_q_best.append(0.0)
             continue
         best = 0.0
-        for ch, sc in hits:
+        for ch, sc in combined_hits:
             if sc > best:
                 best = sc
             prev = merged_scores.get(ch.chunk_id, -1.0)
@@ -705,7 +767,7 @@ async def answer_with_rag(
         )
         user_prompt = user_prompt.replace("Вопрос:\n", f"{explain_format_text}Вопрос:\n", 1)
     answer = await ollama_chat(
-        client, base_url, selected_model, SYSTEM_ANSWER, user_prompt, timeout=120.0
+        client, base_url, selected_model, SYSTEM_ANSWER, user_prompt, temperature=0.6, timeout=120.0
     )
     reviewed = await review_answer(
         client=client,
@@ -729,7 +791,8 @@ async def answer_with_rag(
 
     # Этап 5: пост-обработка
     is_complex = analysis.has_multi_intent or len(analysis.subquestions) > 1 or len(user_message) > 140
-    out = _postprocess_answer(answer, is_complex=is_complex)
+    wants_full_answer = _wants_full_answer(user_message)
+    out = _postprocess_answer(answer, is_complex=is_complex, wants_full_answer=wants_full_answer)
     if len(out) > 25 and _cyrillic_letter_ratio(out) < 0.28:
         return FALLBACK_NO_MATCH
     return out

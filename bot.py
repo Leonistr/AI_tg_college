@@ -46,11 +46,23 @@ TOPIC_MAP = {
 }
 GREETING_WORDS = {"привет", "здравствуйте", "салам", "добрый день", "добрый вечер", "хай"}
 REPEAT_REMINDER_VARIANTS = (
-    "Мы это уже обсудили. Я не попугай, давай двигаться дальше по делу.",
-    "Понимаю, вопрос повторяется. Не дублируй много раз одно и то же — так отвечу точнее.",
-    "Этот вопрос уже был. Я помню контекст, лучше уточни деталь, а не повторяй дословно.",
-    "Я уже отвечал на это. Давай без кругов: добавь, что именно осталось непонятно.",
+    "Я уже отвечал на это, давай коротко двинемся дальше по делу.",
+    "Вижу повтор вопроса. Чтобы не ходить по кругу, уточни, что именно осталось непонятно.",
+    "Повторяется та же тема. Давай точечно: что именно уточнить — вход, сроки или где смотреть?",
+    "Я помню этот вопрос. Чтобы помочь лучше, добавь новую деталь, а не повтор дословно.",
 )
+SMALLTALK_PATTERNS = (
+    "как дела",
+    "как жизнь",
+    "чем занимаешься",
+    "скучно",
+    "давай поговорим",
+    "что делаешь",
+)
+ABUSE_PATTERNS = ("тупой", "дебил", "чмо", "мудак", "ты гей", "идиот")
+SUMMARY_SYSTEM_PROMPT = """Сожми контекст диалога студент-ассистент в 2-3 коротких предложения.
+Пиши только факты из диалога: что уже выяснили, что ещё нужно уточнить, чего делать нельзя.
+Без списков, без нумерации, без воды."""
 RUNTIME_OVERRIDES_FILE = "_runtime_overrides.json"
 BOT_META_PATTERNS = (
     "как тебя зовут",
@@ -419,6 +431,18 @@ def _is_non_college_math(text: str) -> bool:
     return False
 
 
+def _is_smalltalk_message(text: str) -> bool:
+    low = text.lower().strip()
+    if not low or _looks_like_college_question(low):
+        return False
+    return any(p in low for p in SMALLTALK_PATTERNS)
+
+
+def _is_abusive_message(text: str) -> bool:
+    low = text.lower().strip()
+    return any(p in low for p in ABUSE_PATTERNS)
+
+
 def _needs_recent_context(text: str) -> bool:
     low = text.lower().strip()
     if not low or _looks_like_college_question(low):
@@ -449,6 +473,16 @@ def _remember_user_message(state: dict, text: str, max_items: int = 4) -> None:
     state["recent_user_messages"] = history
 
 
+def _remember_bot_message(state: dict, text: str, max_items: int = 4) -> None:
+    history = state.get("recent_bot_messages", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(text)
+    if len(history) > max_items:
+        history = history[-max_items:]
+    state["recent_bot_messages"] = history
+
+
 def _get_recent_user_context(state: dict, limit: int = 3) -> list[str]:
     history = state.get("recent_user_messages", [])
     if not isinstance(history, list) or len(history) <= 1:
@@ -458,6 +492,32 @@ def _get_recent_user_context(state: dict, limit: int = 3) -> list[str]:
     if not prev:
         return []
     return prev[-limit:]
+
+
+def _get_recent_bot_context(state: dict, limit: int = 3) -> list[str]:
+    history = state.get("recent_bot_messages", [])
+    if not isinstance(history, list):
+        return []
+    prev = [str(x).strip() for x in history if str(x).strip()]
+    if not prev:
+        return []
+    return prev[-limit:]
+
+
+def _dialog_context_snippet(state: dict) -> str:
+    summary = str(state.get("dialog_summary", "")).strip()
+    return summary
+
+
+def _update_repeat_streak(state: dict, normalized_q: str) -> int:
+    last_q = str(state.get("last_normalized_question", "")).strip()
+    if normalized_q and normalized_q == last_q:
+        streak = int(state.get("repeat_streak", 1)) + 1
+    else:
+        streak = 1
+    state["repeat_streak"] = streak
+    state["last_normalized_question"] = normalized_q
+    return streak
 
 
 def _repeat_reminder_prefix(state: dict) -> str:
@@ -482,6 +542,11 @@ def _get_dialog_state(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -
             "suggested_topic": "",
             "recent_questions": [],
             "recent_user_messages": [],
+            "recent_bot_messages": [],
+            "dialog_summary": "",
+            "repeat_streak": 1,
+            "last_normalized_question": "",
+            "message_count": 0,
             "repeat_notice_idx": 0,
         }
         states[user_id] = state
@@ -578,6 +643,50 @@ async def _persist_and_rebuild(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.bot_data["knowledge"]
     save_knowledge(path, data)
     context.bot_data["rag_index"] = await _build_rag(context.application)
+
+
+async def _maybe_refresh_dialog_summary(context: ContextTypes.DEFAULT_TYPE, state: dict) -> None:
+    count = int(state.get("message_count", 0))
+    if count <= 0 or count % 3 != 0:
+        return
+    client: httpx.AsyncClient | None = context.bot_data.get("http_client")
+    base_url = str(context.bot_data.get("ollama_base_url", "")).strip()
+    model = str(context.bot_data.get("ollama_model_explain", "mistral")).strip() or "mistral"
+    if client is None or not base_url:
+        return
+    old_summary = str(state.get("dialog_summary", "")).strip() or "Нет."
+    user_hist = _get_recent_user_context(state, limit=4)
+    bot_hist = _get_recent_bot_context(state, limit=4)
+    if not user_hist and not bot_hist:
+        return
+    user_block = "\n".join(f"- {x}" for x in user_hist) or "- Нет данных"
+    bot_block = "\n".join(f"- {x}" for x in bot_hist) or "- Нет данных"
+    prompt = (
+        f"Предыдущее summary:\n{old_summary}\n\n"
+        f"Последние сообщения пользователя:\n{user_block}\n\n"
+        f"Последние ответы ассистента:\n{bot_block}\n\n"
+        "Обнови summary."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+    try:
+        url = f"{base_url.rstrip('/')}/api/chat"
+        r = await client.post(url, json=payload, timeout=45.0)
+        r.raise_for_status()
+        body = r.json()
+        msg = (body.get("message") or {}).get("content", "")
+        summary = str(msg).strip()
+        if summary:
+            state["dialog_summary"] = re.sub(r"\s{2,}", " ", summary)
+    except Exception:
+        logger.debug("Не удалось обновить dialog summary", exc_info=True)
 
 
 async def post_init(application: Application) -> None:
@@ -756,6 +865,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = _get_dialog_state(context, user_id)
     normalized_q = _normalize_question(text)
     is_repeat_question = normalized_q and normalized_q in state.get("recent_questions", [])
+    repeat_streak = _update_repeat_streak(state, normalized_q)
+    state["message_count"] = int(state.get("message_count", 0)) + 1
     _remember_user_message(state, text, max_items=4)
     recent_user_context = _get_recent_user_context(state, limit=3)
 
@@ -793,6 +904,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if len(recent) > 8:
                 recent = recent[-8:]
         state["recent_questions"] = recent
+        _remember_bot_message(state, answer, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
         await update.message.reply_text(answer)
         return
 
@@ -802,7 +915,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
         state["last_bot_answer"] = meta
+        _remember_bot_message(state, meta, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
         await update.message.reply_text(meta)
+        return
+
+    if _is_abusive_message(text):
+        answer = "Давай без оскорблений. Если есть вопрос по колледжу или учёбе, помогу по делу."
+        state["fallback_stage"] = 0
+        state["awaiting_clarification"] = False
+        state["last_user_question"] = text
+        state["last_bot_answer"] = answer
+        _remember_bot_message(state, answer, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
+        await update.message.reply_text(answer)
+        return
+
+    if _is_smalltalk_message(text):
+        answer = "Могу поболтать коротко, но полезнее — задай вопрос по учёбе или колледжу."
+        state["fallback_stage"] = 0
+        state["awaiting_clarification"] = False
+        state["last_user_question"] = text
+        state["last_bot_answer"] = answer
+        _remember_bot_message(state, answer, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
+        await update.message.reply_text(answer)
         return
 
     direct = _direct_college_reply(text, context.bot_data.get("knowledge", {}))
@@ -823,6 +960,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if len(recent) > 8:
                 recent = recent[-8:]
         state["recent_questions"] = recent
+        _remember_bot_message(state, direct, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
         await update.message.reply_text(direct)
         return
 
@@ -838,6 +977,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
         state["last_bot_answer"] = direct_study
+        _remember_bot_message(state, direct_study, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
         await update.message.reply_text(direct_study)
         return
 
@@ -847,6 +988,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
         state["last_bot_answer"] = answer
+        _remember_bot_message(state, answer, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
+        await update.message.reply_text(answer)
+        return
+
+    if repeat_streak >= 3 and len(text.split()) >= 4:
+        last_answer = str(state.get("last_bot_answer", "")).strip()
+        answer = (
+            "Вижу, что мы застряли на одном вопросе. "
+            "Давай точнее: что именно нужно — где зайти, какие данные для входа или к кому обратиться?"
+        )
+        if last_answer:
+            answer = f"{answer} Коротко повторю: {last_answer}"
+        state["last_user_question"] = text
+        state["last_bot_answer"] = answer
+        _remember_bot_message(state, answer, max_items=4)
+        await _maybe_refresh_dialog_summary(context, state)
         await update.message.reply_text(answer)
         return
 
@@ -865,6 +1023,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     qa_examples = context.bot_data.get("qa_examples", [])
     topic_hint = _extract_topic_hint(text)
     query_for_pipeline = text
+    dialog_summary = _dialog_context_snippet(state)
+    if dialog_summary and (state.get("awaiting_clarification", False) or _needs_recent_context(text)):
+        query_for_pipeline = f"Контекст диалога: {dialog_summary}\nТекущий вопрос: {query_for_pipeline}"
     if _needs_recent_context(text) and recent_user_context:
         anchor = _pick_recent_college_message(recent_user_context)
         if anchor:
@@ -984,6 +1145,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         state["repeat_notice_idx"] = 0
     state["last_bot_answer"] = answer
+    _remember_bot_message(state, answer, max_items=4)
+    await _maybe_refresh_dialog_summary(context, state)
     recent = state.get("recent_questions", [])
     if normalized_q:
         recent.append(normalized_q)

@@ -43,6 +43,7 @@ python bot.py
 | `bot.py` | Telegram handlers, загрузка знаний из папки |
 | `pipeline.py` | Классификация, RAG-ответ, роутинг моделей, review |
 | `rag.py` | Чанки, эмбеддинги, кэш векторов |
+| `tools/eval_dialogs.py` | Быстрая офлайн-оценка диалогов из jsonl |
 | `data/college_ai_knowledge/` | Источник правды: `.md` |
 
 Источник знаний **только** каталог `data/college_ai_knowledge` (см. `bot.py`).
