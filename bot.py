@@ -367,7 +367,7 @@ def _direct_college_reply(text: str, data: dict) -> str | None:
         if address:
             return f"Адрес колледжа: {address}."
         return "Точный адрес лучше уточнить у администрации колледжа."
-    if "сайт" in low:
+    if "сайт" in low and re.search(r"(какой|где|дай|подскажи|официаль|ссылк|адрес)\w*", low):
         if website:
             return f"Официальный сайт колледжа: {website}."
         return "Сайт сейчас не указан, уточните у администрации."
@@ -391,6 +391,13 @@ def _direct_study_reply(text: str) -> str | None:
         return None
     if re.search(r"(исправ|измен|поднят|повыс)\w*\s+оцен", low):
         return "По материалам колледжа: по изменению оценки лучше сразу подойти к преподавателю."
+    if re.search(r"(где|как).{0,30}(посмотр|узнат|провер).{0,20}оцен", low) or (
+        "оцен" in low and "smart" in low
+    ):
+        return (
+            "Оценки смотри в SmartNation: логин — ИИН, пароль — последние 6 цифр ИИН + abc. "
+            "Если не пускает, напиши преподавателю или в администрацию."
+        )
     if ("не понял" in low or "не понимаю" in low) and (
         "тема" in low or "информат" in low or "програм" in low
     ):
@@ -410,6 +417,26 @@ def _is_non_college_math(text: str) -> bool:
     if re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
         return True
     return False
+
+
+def _needs_recent_context(text: str) -> bool:
+    low = text.lower().strip()
+    if not low or _looks_like_college_question(low):
+        return False
+    if len(low.split()) > 8:
+        return False
+    return bool(
+        re.search(r"\b(это|этот|эта|эти|там|туда|так|тогда|он|она|они|его|ее|её|их)\b", low)
+        or re.search(r"\b(а как|а где|и как|и где)\b", low)
+    )
+
+
+def _pick_recent_college_message(messages: list[str]) -> str | None:
+    for msg in reversed(messages):
+        s = str(msg).strip()
+        if s and _looks_like_college_question(s):
+            return s
+    return None
 
 
 def _remember_user_message(state: dict, text: str, max_items: int = 4) -> None:
@@ -749,12 +776,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if _is_greeting_or_small_talk(text):
-        answer = "Привет! Спрашивай по колледжу или учёбе — отвечу коротко и по делу."
+        if is_repeat_question:
+            prefix = _repeat_reminder_prefix(state)
+            answer = f"{prefix} Привет. Если готов, задай один конкретный вопрос по колледжу."
+        else:
+            state["repeat_notice_idx"] = 0
+            answer = "Привет! Спрашивай по колледжу или учёбе — отвечу коротко и по делу."
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
         state["suggested_topic"] = ""
         state["last_user_question"] = text
         state["last_bot_answer"] = answer
+        recent = state.get("recent_questions", [])
+        if normalized_q:
+            recent.append(normalized_q)
+            if len(recent) > 8:
+                recent = recent[-8:]
+        state["recent_questions"] = recent
         await update.message.reply_text(answer)
         return
 
@@ -773,6 +811,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             prefix = _repeat_reminder_prefix(state)
             if prefix.lower() not in direct.lower():
                 direct = f"{prefix} {direct}"
+        else:
+            state["repeat_notice_idx"] = 0
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
@@ -788,6 +828,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     direct_study = _direct_study_reply(text)
     if direct_study:
+        if is_repeat_question:
+            prefix = _repeat_reminder_prefix(state)
+            if prefix.lower() not in direct_study.lower():
+                direct_study = f"{prefix} {direct_study}"
+        else:
+            state["repeat_notice_idx"] = 0
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
         state["last_user_question"] = text
@@ -819,15 +865,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     qa_examples = context.bot_data.get("qa_examples", [])
     topic_hint = _extract_topic_hint(text)
     query_for_pipeline = text
-    history_prefix = ""
-    if recent_user_context and (
-        len(text.split()) <= 12 or state.get("awaiting_clarification", False) or is_repeat_question
-    ):
-        history_lines = "\n".join(f"- {msg}" for msg in recent_user_context)
-        history_prefix = (
-            "Недавние сообщения пользователя (для контекста, без выдумок):\n"
-            f"{history_lines}"
-        )
+    if _needs_recent_context(text) and recent_user_context:
+        anchor = _pick_recent_college_message(recent_user_context)
+        if anchor:
+            query_for_pipeline = f"{anchor}. Уточнение студента: {text}."
 
     # Уточнение «туда войти» после ответа про SmartNation — в эмбеддинг явно добавит pipeline
     lb = str(state.get("last_bot_answer", "")).lower()
@@ -866,13 +907,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prev_q = state.get("last_user_question", "")
         query_for_pipeline = f"{prev_q}. Уточнение студента: {text}."
         state["awaiting_clarification"] = False
-
-    if history_prefix:
-        query_for_pipeline = (
-            f"{history_prefix}\n\n"
-            f"Текущее сообщение:\n{query_for_pipeline}\n\n"
-            "Учитывай историю только для связи контекста."
-        )
 
     await update.message.chat.send_action(action="typing")
     if rag is None:

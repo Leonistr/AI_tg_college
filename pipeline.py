@@ -66,7 +66,19 @@ FALLBACK_CLARIFY = (
 FALLBACK_OFFTOPIC = "Я помогаю по колледжу и учёбе. Напиши вопрос в этой теме."
 MAX_INPUT_CHARS = 1800
 MAX_INPUT_LINES = 35
-AGGRESSIVE_MARKERS = ("тупой", "идиот", "ненавижу", "дебил", "пошел", "пошёл", "сдохни")
+AGGRESSIVE_MARKERS = (
+    "тупой",
+    "идиот",
+    "ненавижу",
+    "дебил",
+    "пошел",
+    "пошёл",
+    "сдохни",
+    "ты гей",
+    "гей",
+    "чмо",
+    "мудак",
+)
 MANIPULATION_MARKERS = (
     "игнорируй",
     "ignore previous",
@@ -208,8 +220,8 @@ def _quick_classify_message(text: str) -> ClassificationResult:
         return ClassificationResult(kind="overloaded", reason="too_long")
     if any(x in low for x in MANIPULATION_MARKERS):
         return ClassificationResult(kind="manipulation", reason="prompt_attack")
-    if any(x in low for x in AGGRESSIVE_MARKERS) and len(t.split()) > 12:
-        return ClassificationResult(kind="manipulation", reason="aggression")
+    if any(x in low for x in AGGRESSIVE_MARKERS):
+        return ClassificationResult(kind="manipulation", reason="abuse")
     if any(h in low for h in COLLEGE_HINTS):
         return ClassificationResult(kind="college_question", reason="college_hint")
     if re.fullmatch(r"[\d\s\+\-\*/\(\)=\.,]+", t) or re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
