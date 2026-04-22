@@ -683,7 +683,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if _is_greeting_or_small_talk(text):
-        answer = "Привет! Напишите вопрос по колледжу или учёбе — отвечу по материалам базы."
+        answer = "Привет! Спрашивай по колледжу или учёбе — отвечу коротко и по делу."
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
         state["suggested_topic"] = ""
