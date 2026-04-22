@@ -102,6 +102,8 @@ COLLEGE_HINTS = (
     "сайт",
     "портал",
     "систем",
+    "информат",
+    "програм",
 )
 DIRECT_TOPIC_HINTS = (
     "оцен",
@@ -210,14 +212,16 @@ def _quick_classify_message(text: str) -> ClassificationResult:
         return ClassificationResult(kind="manipulation", reason="aggression")
     if any(h in low for h in COLLEGE_HINTS):
         return ClassificationResult(kind="college_question", reason="college_hint")
+    if re.fullmatch(r"[\d\s\+\-\*/\(\)=\.,]+", t) or re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
+        return ClassificationResult(kind="offtopic", reason="math_expression")
     letters = len(re.findall(r"[A-Za-zА-Яа-яЁё]", t))
     if letters < 3:
         return ClassificationResult(kind="nonsense", reason="too_little_text")
     if len(t.split()) > 140:
         return ClassificationResult(kind="overloaded", reason="too_many_words")
     if len(t) <= 120 and len(t.split()) <= 12:
-        # Короткие простые сообщения по умолчанию считаем нормальными.
-        return ClassificationResult(kind="college_question", reason="short_message")
+        # Короткое сообщение без признаков колледжа отправляем на уточнение LLM-классификатором.
+        return ClassificationResult(kind="unknown", reason="short_without_hint")
     return ClassificationResult(kind="unknown", reason="need_llm")
 
 

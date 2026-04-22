@@ -379,6 +379,33 @@ def _direct_college_reply(text: str, data: dict) -> str | None:
     return None
 
 
+def _direct_study_reply(text: str) -> str | None:
+    low = text.lower().strip()
+    if not low:
+        return None
+    if re.search(r"(исправ|измен|поднят|повыс)\w*\s+оцен", low):
+        return "По материалам колледжа: по изменению оценки лучше сразу подойти к преподавателю."
+    if ("не понял" in low or "не понимаю" in low) and (
+        "тема" in low or "информат" in low or "програм" in low
+    ):
+        return (
+            "Ок, разберём. Уточни, это теория или практика, и какая тема: "
+            "основы ПК, файлы, базы данных или программирование."
+        )
+    return None
+
+
+def _is_non_college_math(text: str) -> bool:
+    low = text.lower().strip()
+    if not low or _looks_like_college_question(low):
+        return False
+    if re.fullmatch(r"[\d\s\+\-\*/\(\)=\.,]+", low):
+        return True
+    if re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
+        return True
+    return False
+
+
 def _get_dialog_state(context: ContextTypes.DEFAULT_TYPE, user_id: int | None) -> dict:
     states = context.bot_data.setdefault("dialog_states", {})
     if user_id is None:
@@ -718,6 +745,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(direct)
         return
 
+    direct_study = _direct_study_reply(text)
+    if direct_study:
+        state["fallback_stage"] = 0
+        state["awaiting_clarification"] = False
+        state["last_user_question"] = text
+        state["last_bot_answer"] = direct_study
+        await update.message.reply_text(direct_study)
+        return
+
+    if _is_non_college_math(text):
+        answer = "Я помогаю по колледжу и учёбе. По математике вне контекста колледжа не считаю."
+        state["fallback_stage"] = 0
+        state["awaiting_clarification"] = False
+        state["last_user_question"] = text
+        state["last_bot_answer"] = answer
+        await update.message.reply_text(answer)
+        return
+
     base_url = context.bot_data["ollama_base_url"]
     quick_model = context.bot_data["ollama_model_quick"]
     explain_model = context.bot_data["ollama_model_explain"]
@@ -750,9 +795,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         awaiting = bool(state.get("awaiting_clarification", False))
         suggested = str(state.get("suggested_topic", "")).strip().lower()
         topic_l = topic_hint.lower()
-        merge_ok = awaiting or (
-            suggested and (topic_l in suggested or suggested in topic_l)
-        ) or (bool(prev_q) and _looks_like_college_question(prev_q))
+        merge_ok = (
+            (awaiting and bool(prev_q) and _looks_like_college_question(prev_q))
+            or (suggested and (topic_l in suggested or suggested in topic_l))
+            or (bool(prev_q) and _looks_like_college_question(prev_q))
+        )
         if merge_ok and prev_q:
             query_for_pipeline = f"{prev_q}. Уточнение студента: тема — {topic_hint}."
         else:
@@ -761,7 +808,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Исходная фраза: «{text}». Ответь по материалам колледжа, кратко."
             )
         state["awaiting_clarification"] = False
-    elif state.get("awaiting_clarification", False) and len(text.split()) <= 5:
+    elif (
+        state.get("awaiting_clarification", False)
+        and len(text.split()) <= 5
+        and _looks_like_college_question(state.get("last_user_question", ""))
+    ):
         prev_q = state.get("last_user_question", "")
         query_for_pipeline = f"{prev_q}. Уточнение студента: {text}."
         state["awaiting_clarification"] = False
