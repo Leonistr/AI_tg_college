@@ -312,6 +312,31 @@ def _is_greeting_only(text: str) -> bool:
     return norm in GREETING_WORDS
 
 
+def _is_greeting_or_small_talk(text: str) -> bool:
+    """Приветствия и «просто поздоровался» — не отправлять в RAG и не склеивать с уточняющим контекстом."""
+    if _looks_like_college_question(text):
+        return False
+    if _is_greeting_only(text):
+        return True
+    t = text.strip()
+    if not t or len(t.split()) > 14:
+        return False
+    low = t.lower()
+    if re.search(r"\bпривет(ик|ики|очка)?\b", low) or (low.startswith("привет") and len(t.split()) <= 3):
+        return True
+    if re.search(r"\b(здорово|здрасьте|здравствуй|салам|хай)\b", low):
+        return True
+    if re.search(r"\bдобрый\s+(день|вечер|утро)\b", low) or re.search(r"\bдоброе\s+утро\b", low):
+        return True
+    if re.search(r"поздароваться|поздороваться|поздоровк", low):
+        return True
+    if re.search(r"\bхотел[аи]?\s+(просто\s+)?(поздороваться|поздароваться)\b", low):
+        return True
+    if re.search(r"\bпросто\s+(поздороваться|поздароваться|привет)\b", low):
+        return True
+    return False
+
+
 def _direct_college_reply(text: str, data: dict) -> str | None:
     low = text.lower()
     college = data.get("college")
@@ -657,8 +682,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(f"Не удалось сохранить: {e}")
         return
 
-    if _is_greeting_only(text):
-        answer = "Привет! Напишите ваш вопрос по колледжу, и я коротко подскажу."
+    if _is_greeting_or_small_talk(text):
+        answer = "Привет! Напишите вопрос по колледжу или учёбе — отвечу по материалам базы."
+        state["fallback_stage"] = 0
+        state["awaiting_clarification"] = False
+        state["suggested_topic"] = ""
         state["last_user_question"] = text
         state["last_bot_answer"] = answer
         await update.message.reply_text(answer)
@@ -705,6 +733,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     qa_examples = context.bot_data.get("qa_examples", [])
     topic_hint = _extract_topic_hint(text)
     query_for_pipeline = text
+
+    # Уточнение «туда войти» после ответа про SmartNation — в эмбеддинг явно добавит pipeline
+    lb = str(state.get("last_bot_answer", "")).lower()
+    if ("smart" in lb or "смарт" in lb) and re.search(
+        r"\b(туда|туда\s+же|войти|зайти|вход|логин|парол)\w*\b", text.lower()
+    ):
+        query_for_pipeline = (
+            f"{text}\n(контекст: только что речь шла о системе SmartNation — оценки и расписание; "
+            f"нужен вход, логин или пароль по правилам колледжа.)"
+        )
 
     # Короткие темы («расписание», «оценки»): не склеивать с нерелевантным прошлым вопросом.
     if topic_hint and len(text.split()) <= 4:

@@ -431,6 +431,30 @@ async def analyze_user_message(
     return AnalysisResult(subquestions=subquestions, topics=topics, has_multi_intent=has_multi)
 
 
+def _queries_for_embedding(user_message: str, subquestions: list[str]) -> list[str]:
+    """
+    Расширение текста только для эмбеддинга: «туда войти» без слова SmartNation часто матчится не на тот чанк.
+    """
+    low = user_message.lower()
+    building = ("колледж", "здание", "адрес", "актобе", "маресьев", "корпус", "аудитор")
+    if any(b in low for b in building):
+        return list(subquestions)
+    portal_tail = (
+        " SmartNation портал студента оценки расписание логин пароль ИИН инструкция вход"
+    )
+    if "smart" in low or "смарт" in low or "xpstudent" in low:
+        return [f"{q}{portal_tail}" for q in subquestions]
+    if re.search(r"туда.{0,24}(войти|зайти|залогин|вход)", low) or re.search(
+        r"(войти|зайти|вход).{0,24}туда", low
+    ):
+        return [f"{q}{portal_tail}" for q in subquestions]
+    if re.search(r"\b(логин|парол\w*|войти|зайти)\b", low) and re.search(
+        r"\b(оценк|расписан|smart|смарт|систем|портал)\b", low
+    ):
+        return [f"{q}{portal_tail}" for q in subquestions]
+    return list(subquestions)
+
+
 def _pick_best_context_blocks(
     scored_chunks: list[tuple[str, str, str, float]],
     topics: list[str],
@@ -573,8 +597,9 @@ async def answer_with_rag(
     if _is_too_generic_question(analysis):
         return FALLBACK_CLARIFY
 
-    # Этап 3: semantic search
-    query_embs = await ollama_embed_batch(client, base_url, embed_model, analysis.subquestions)
+    # Этап 3: semantic search (текст для embed может быть расширен синонимами портала)
+    embed_queries = _queries_for_embedding(user_message, analysis.subquestions)
+    query_embs = await ollama_embed_batch(client, base_url, embed_model, embed_queries)
     if len(query_embs) != len(analysis.subquestions):
         raise ValueError("Число эмбеддингов запроса не совпало с числом подвопросов")
 
