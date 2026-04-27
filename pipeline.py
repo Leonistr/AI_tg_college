@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import re
 from dataclasses import dataclass
 
@@ -431,6 +432,7 @@ async def review_answer(
     user_prompt: str,
     context_block: str,
     answer: str,
+    timeout: float = 45.0,
 ) -> ReviewResult:
     review_user_text = (
         f"Вопрос студента:\n{user_prompt}\n\n"
@@ -445,7 +447,7 @@ async def review_answer(
             system=SYSTEM_REVIEW,
             user_text=review_user_text,
             temperature=0.1,
-            timeout=90.0,
+            timeout=timeout,
         )
         return _parse_review_json(raw)
     except Exception:
@@ -477,6 +479,7 @@ async def rewrite_answer_style(
     user_prompt: str,
     context_block: str,
     answer: str,
+    timeout: float = 25.0,
 ) -> str:
     style_user_text = (
         f"Вопрос студента:\n{user_prompt}\n\n"
@@ -492,7 +495,7 @@ async def rewrite_answer_style(
             system=SYSTEM_STYLE_REWRITE,
             user_text=style_user_text,
             temperature=0.2,
-            timeout=60.0,
+            timeout=timeout,
         )
         out = raw.strip()
         return out or answer
@@ -517,12 +520,21 @@ async def analyze_user_message(
     else:
         try:
             raw = await ollama_chat(
-                client, base_url, chat_model, SYSTEM_DECOMPOSE, text, temperature=0.2, timeout=60.0
+                client, base_url, chat_model, SYSTEM_DECOMPOSE, text, temperature=0.2, timeout=25.0
             )
             subquestions = _parse_subquestions(raw, text)
         except Exception:
             logger.exception("decompose failed")
             subquestions = [text]
+
+    # Быстрый путь: короткий однотематический вопрос — без отдельного LLM-анализа тем.
+    if len(subquestions) == 1 and len(text) <= 120 and len(text.split()) <= 16:
+        seed = text.lower()
+        guessed = []
+        for w in ("оценки", "пересдача", "пропуски", "расписание", "практика", "справка", "допуск", "поступление"):
+            if w in seed:
+                guessed.append(w)
+        return AnalysisResult(subquestions=subquestions, topics=guessed[:5], has_multi_intent=False)
 
     # Шаг 1б: анализ тем
     try:
@@ -533,7 +545,7 @@ async def analyze_user_message(
             SYSTEM_ANALYZE,
             "Вопросы:\n" + "\n".join(f"- {q}" for q in subquestions),
             temperature=0.2,
-            timeout=40.0,
+            timeout=20.0,
         )
         topics, has_multi = _parse_topics_json(raw_topics)
     except Exception:
@@ -745,6 +757,14 @@ async def answer_with_rag(
     max_context_blocks: int,
     qa_examples: list[dict] | None = None,
 ) -> str:
+    started_at = time.monotonic()
+
+    def _elapsed() -> float:
+        return time.monotonic() - started_at
+
+    def _time_left(total_budget_sec: float = 55.0) -> float:
+        return max(5.0, total_budget_sec - _elapsed())
+
     # Для анализа/классификации используем "объясняющую" модель как дефолт.
     analyzer_model = explain_model
     # Этап 1: классификация сообщения
@@ -853,37 +873,56 @@ async def answer_with_rag(
         )
         user_prompt = user_prompt.replace("Вопрос:\n", f"{explain_format_text}Вопрос:\n", 1)
     answer = await ollama_chat(
-        client, base_url, selected_model, SYSTEM_ANSWER, user_prompt, temperature=0.6, timeout=120.0
+        client,
+        base_url,
+        selected_model,
+        SYSTEM_ANSWER,
+        user_prompt,
+        temperature=0.6,
+        timeout=_time_left(45.0),
     )
-    reviewed = await review_answer(
-        client=client,
-        base_url=base_url,
-        review_model=review_model,
-        user_prompt=q_block,
-        context_block=context_block,
-        answer=answer,
-    )
-    if not reviewed.ok:
-        fixed = reviewed.fixed_answer
-        llm1_lang = _cyrillic_letter_ratio(answer) >= 0.35
-        fixed_lang = bool(fixed) and _cyrillic_letter_ratio(fixed) >= 0.35
-        if fixed and fixed_lang:
-            answer = fixed
-        elif fixed and not fixed_lang and llm1_lang:
-            # Ревью иногда «ломает» язык; не подменяем нормальный русский ответ LLM1.
-            pass
-        else:
-            answer = FALLBACK_NO_MATCH
 
-    # Этап 4.5: стилизация тона без изменения фактов.
-    answer = await rewrite_answer_style(
-        client=client,
-        base_url=base_url,
-        model=selected_model,
-        user_prompt=q_block,
-        context_block=context_block,
-        answer=answer,
+    is_simple_query = (
+        len(analysis.subquestions) == 1
+        and not analysis.has_multi_intent
+        and len(user_message) <= 120
+        and len(context_blocks) <= 2
     )
+
+    # Для простых вопросов приоритезируем скорость: ревью запускаем только если осталось время.
+    if (not is_simple_query) or _elapsed() < 28.0:
+        reviewed = await review_answer(
+            client=client,
+            base_url=base_url,
+            review_model=review_model,
+            user_prompt=q_block,
+            context_block=context_block,
+            answer=answer,
+            timeout=_time_left(52.0),
+        )
+        if not reviewed.ok:
+            fixed = reviewed.fixed_answer
+            llm1_lang = _cyrillic_letter_ratio(answer) >= 0.35
+            fixed_lang = bool(fixed) and _cyrillic_letter_ratio(fixed) >= 0.35
+            if fixed and fixed_lang:
+                answer = fixed
+            elif fixed and not fixed_lang and llm1_lang:
+                # Ревью иногда «ломает» язык; не подменяем нормальный русский ответ LLM1.
+                pass
+            else:
+                answer = FALLBACK_NO_MATCH
+
+    # Стилизацию делаем, только если не вышли за разумный бюджет времени.
+    if _elapsed() < 42.0:
+        answer = await rewrite_answer_style(
+            client=client,
+            base_url=base_url,
+            model=selected_model,
+            user_prompt=q_block,
+            context_block=context_block,
+            answer=answer,
+            timeout=_time_left(55.0),
+        )
     # Если после стилизации потерялся practical next step, мягко добавим.
     if not _has_practical_step(answer):
         answer = f"{answer.rstrip()} Если что, напиши куратору или преподавателю."

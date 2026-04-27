@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import httpx
@@ -67,6 +68,44 @@ def _ensure_event_loop() -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def _setup_file_logging(base: Path) -> Path:
+    """
+    Подключает запись логов в отдельный файл с ротацией.
+    По умолчанию: logs/bot.log, 5MB, 5 бэкапов.
+    """
+    rel = os.environ.get("BOT_LOG_FILE", "logs/bot.log").strip() or "logs/bot.log"
+    max_bytes_raw = os.environ.get("BOT_LOG_MAX_BYTES", "5242880").strip()
+    backups_raw = os.environ.get("BOT_LOG_BACKUP_COUNT", "5").strip()
+    try:
+        max_bytes = max(1024, int(max_bytes_raw))
+    except ValueError:
+        max_bytes = 5 * 1024 * 1024
+    try:
+        backup_count = max(1, int(backups_raw))
+    except ValueError:
+        backup_count = 5
+
+    log_path = (base / rel).resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+
+    # Не дублируем хендлер при повторной инициализации.
+    for h in root.handlers:
+        if isinstance(h, RotatingFileHandler) and Path(getattr(h, "baseFilename", "")).resolve() == log_path:
+            return log_path
+
+    file_handler = RotatingFileHandler(
+        filename=str(log_path),
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    root.addHandler(file_handler)
+    return log_path
 
 
 def load_knowledge(path: Path) -> dict:
@@ -975,6 +1014,8 @@ def main() -> None:
         raise SystemExit("Задайте TELEGRAM_BOT_TOKEN в .env (см. .env.example)")
 
     base = Path(__file__).resolve().parent
+    log_path = _setup_file_logging(base)
+    logger.info("Логи пишутся в файл: %s", log_path)
     knowledge_path = _resolve_knowledge_path(base)
 
     data = load_knowledge(knowledge_path)
