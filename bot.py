@@ -942,9 +942,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "Проверьте OLLAMA_MODEL_UNIFIED и OLLAMA_EMBED_MODEL в .env."
             )
             logger.warning("ollama http error: %s", e.response.text[:500])
+        except (httpx.ReadTimeout, TimeoutError):
+            answer = (
+                "Сервер моделей отвечает слишком долго. "
+                "Попробуй повторить вопрос чуть короче или проверь, что Ollama не перегружен."
+            )
+            logger.warning("ollama timeout while answering")
         except Exception as e:
             logger.exception("answer error")
-            answer = f"Произошла ошибка: {e}"
+            details = str(e).strip() or e.__class__.__name__
+            answer = f"Произошла ошибка: {details}"
 
     # Многоуровневый fallback, чтобы не зацикливаться на одной фразе
     if answer == FALLBACK_CLARIFY:
