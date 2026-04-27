@@ -17,8 +17,21 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from dialog_rules import (
+    bot_meta_reply,
+    direct_college_reply,
+    direct_study_reply,
+    extract_topic_hint,
+    is_abusive_message,
+    is_greeting_or_small_talk,
+    is_non_college_math,
+    is_smalltalk_message,
+    looks_like_college_question,
+    needs_recent_context,
+    normalize_question,
+    pick_recent_college_message,
+)
 from pipeline import (
-    COLLEGE_HINTS,
     FALLBACK_CLARIFY,
     FALLBACK_FILTER,
     FALLBACK_NO_MATCH,
@@ -32,74 +45,16 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-TOPIC_MAP = {
-    "оцен": "оценки",
-    "распис": "расписание",
-    "пересда": "пересдача",
-    "пропуск": "пропуски",
-    "поступ": "поступление",
-    "специаль": "специальности",
-    "практик": "практика",
-    "допуск": "допуск",
-    "справк": "справки",
-    "колледж": "колледж",
-}
-GREETING_WORDS = {"привет", "здравствуйте", "салам", "добрый день", "добрый вечер", "хай"}
 REPEAT_REMINDER_VARIANTS = (
     "Я уже отвечал на это, давай коротко двинемся дальше по делу.",
     "Вижу повтор вопроса. Чтобы не ходить по кругу, уточни, что именно осталось непонятно.",
     "Повторяется та же тема. Давай точечно: что именно уточнить — вход, сроки или где смотреть?",
     "Я помню этот вопрос. Чтобы помочь лучше, добавь новую деталь, а не повтор дословно.",
 )
-SMALLTALK_PATTERNS = (
-    "как дела",
-    "как жизнь",
-    "чем занимаешься",
-    "скучно",
-    "давай поговорим",
-    "что делаешь",
-)
-ABUSE_PATTERNS = ("тупой", "дебил", "чмо", "мудак", "ты гей", "идиот")
 SUMMARY_SYSTEM_PROMPT = """Сожми контекст диалога студент-ассистент в 2-3 коротких предложения.
 Пиши только факты из диалога: что уже выяснили, что ещё нужно уточнить, чего делать нельзя.
 Без списков, без нумерации, без воды."""
 RUNTIME_OVERRIDES_FILE = "_runtime_overrides.json"
-BOT_META_PATTERNS = (
-    "как тебя зовут",
-    "как вас зовут",
-    "кто ты",
-    "кто вы",
-    "ты бот",
-    "вы бот",
-    "ты ии",
-    "ты ai",
-    "какое у тебя имя",
-    "какое ваше имя",
-)
-
-
-def _looks_like_college_question(text: str) -> bool:
-    low = text.lower().strip()
-    return any(h in low for h in COLLEGE_HINTS)
-
-
-def _is_bot_meta_question(text: str) -> bool:
-    low = text.lower().strip()
-    return any(p in low for p in BOT_META_PATTERNS)
-
-
-def _bot_meta_reply(text: str) -> str | None:
-    low = text.lower()
-    if not _is_bot_meta_question(text):
-        return None
-    if "зовут" in low or "имя" in low:
-        return (
-            "Меня можно называть EKEB AI ассистент. Я отвечаю по вопросам колледжа "
-            "строго по материалам базы знаний."
-        )
-    if "кто ты" in low or "кто вы" in low or "бот" in low or "ии" in low or "ai" in low:
-        return "Я текстовый ассистент колледжа: подсказываю по учебным вопросам и правилам из базы знаний."
-    return None
 
 
 def _ensure_event_loop() -> None:
@@ -306,161 +261,6 @@ def _next_admin_note_key(knowledge: dict) -> str:
         suffix += 1
         key = f"{base}_{suffix}"
     return key
-
-
-def _extract_topic_hint(text: str) -> str | None:
-    low = text.lower().strip()
-    for part, topic in TOPIC_MAP.items():
-        if part in low:
-            return topic
-    return None
-
-
-def _normalize_question(text: str) -> str:
-    s = text.lower().strip()
-    s = re.sub(r"[^\w\sа-яё]", " ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _is_greeting_only(text: str) -> bool:
-    norm = _normalize_question(text)
-    if not norm:
-        return False
-    return norm in GREETING_WORDS
-
-
-def _is_greeting_or_small_talk(text: str) -> bool:
-    """Приветствия и «просто поздоровался» — не отправлять в RAG и не склеивать с уточняющим контекстом."""
-    if _looks_like_college_question(text):
-        return False
-    if _is_greeting_only(text):
-        return True
-    t = text.strip()
-    if not t or len(t.split()) > 14:
-        return False
-    low = t.lower()
-    if re.search(r"\bпривет(ик|ики|очка)?\b", low) or (low.startswith("привет") and len(t.split()) <= 3):
-        return True
-    if re.search(r"\b(здорово|здрасьте|здравствуй|салам|хай)\b", low):
-        return True
-    if re.search(r"\bдобрый\s+(день|вечер|утро)\b", low) or re.search(r"\bдоброе\s+утро\b", low):
-        return True
-    if re.search(r"поздароваться|поздороваться|поздоровк", low):
-        return True
-    if re.search(r"\bхотел[аи]?\s+(просто\s+)?(поздороваться|поздароваться)\b", low):
-        return True
-    if re.search(r"\bпросто\s+(поздороваться|поздароваться|привет)\b", low):
-        return True
-    return False
-
-
-def _direct_college_reply(text: str, data: dict) -> str | None:
-    low = text.lower()
-    college = data.get("college")
-    if not isinstance(college, dict):
-        return None
-
-    address = str(college.get("address", "")).strip()
-    city = str(college.get("city", "")).strip()
-    website = str(college.get("website", "")).strip()
-    hours = str(college.get("working_hours", "")).strip()
-    director = str(college.get("director", "")).strip()
-    name = str(college.get("name", "")).strip()
-
-    if ("город" in low) or ("в каком городе" in low) or ("какой город" in low):
-        if city:
-            return f"Колледж находится: {city}."
-        if address:
-            return f"В базе указан адрес: {address}. Точный город лучше уточнить у администрации."
-        return "Город сейчас не указан в материалах, уточните у администрации."
-
-    if ("адрес" in low) or ("где находится" in low) or ("где колледж" in low):
-        if address:
-            return f"Адрес колледжа: {address}."
-        return "Точный адрес лучше уточнить у администрации колледжа."
-    if "сайт" in low and re.search(r"(какой|где|дай|подскажи|официаль|ссылк|адрес)\w*", low):
-        if website:
-            return f"Официальный сайт колледжа: {website}."
-        return "Сайт сейчас не указан, уточните у администрации."
-    if ("режим" in low) or ("время работы" in low) or ("часы работы" in low):
-        if hours:
-            return f"Колледж работает: {hours}."
-        return "График работы лучше уточнить у администрации."
-    if ("директор" in low) or ("руководител" in low):
-        if director:
-            return f"Директор колледжа: {director}."
-        return "Информацию о директоре лучше уточнить у администрации."
-    if ("как называется колледж" in low) or ("название колледжа" in low):
-        if name:
-            return f"Название колледжа: {name}."
-    return None
-
-
-def _direct_study_reply(text: str) -> str | None:
-    low = text.lower().strip()
-    if not low:
-        return None
-    if re.search(r"(исправ|измен|поднят|повыс)\w*\s+оцен", low):
-        return "По материалам колледжа: по изменению оценки лучше сразу подойти к преподавателю."
-    if re.search(r"(где|как).{0,30}(посмотр|узнат|провер).{0,20}оцен", low) or (
-        "оцен" in low and "smart" in low
-    ):
-        return (
-            "Оценки смотри в SmartNation: логин — ИИН, пароль — последние 6 цифр ИИН + abc. "
-            "Если не пускает, напиши преподавателю или в администрацию."
-        )
-    if ("не понял" in low or "не понимаю" in low) and (
-        "тема" in low or "информат" in low or "програм" in low
-    ):
-        return (
-            "Ок, разберём. Уточни, это теория или практика, и какая тема: "
-            "основы ПК, файлы, базы данных или программирование."
-        )
-    return None
-
-
-def _is_non_college_math(text: str) -> bool:
-    low = text.lower().strip()
-    if not low or _looks_like_college_question(low):
-        return False
-    if re.fullmatch(r"[\d\s\+\-\*/\(\)=\.,]+", low):
-        return True
-    if re.search(r"\b\d+\s*[\+\-\*/]\s*\d+\b", low):
-        return True
-    return False
-
-
-def _is_smalltalk_message(text: str) -> bool:
-    low = text.lower().strip()
-    if not low or _looks_like_college_question(low):
-        return False
-    return any(p in low for p in SMALLTALK_PATTERNS)
-
-
-def _is_abusive_message(text: str) -> bool:
-    low = text.lower().strip()
-    return any(p in low for p in ABUSE_PATTERNS)
-
-
-def _needs_recent_context(text: str) -> bool:
-    low = text.lower().strip()
-    if not low or _looks_like_college_question(low):
-        return False
-    if len(low.split()) > 8:
-        return False
-    return bool(
-        re.search(r"\b(это|этот|эта|эти|там|туда|так|тогда|он|она|они|его|ее|её|их)\b", low)
-        or re.search(r"\b(а как|а где|и как|и где)\b", low)
-    )
-
-
-def _pick_recent_college_message(messages: list[str]) -> str | None:
-    for msg in reversed(messages):
-        s = str(msg).strip()
-        if s and _looks_like_college_question(s):
-            return s
-    return None
 
 
 def _remember_user_message(state: dict, text: str, max_items: int = 4) -> None:
@@ -863,7 +663,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     user_id = _get_user_id(update)
     state = _get_dialog_state(context, user_id)
-    normalized_q = _normalize_question(text)
+    normalized_q = normalize_question(text)
     is_repeat_question = normalized_q and normalized_q in state.get("recent_questions", [])
     repeat_streak = _update_repeat_streak(state, normalized_q)
     state["message_count"] = int(state.get("message_count", 0)) + 1
@@ -886,7 +686,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(f"Не удалось сохранить: {e}")
         return
 
-    if _is_greeting_or_small_talk(text):
+    if is_greeting_or_small_talk(text):
         if is_repeat_question:
             prefix = _repeat_reminder_prefix(state)
             answer = f"{prefix} Привет. Если готов, задай один конкретный вопрос по колледжу."
@@ -909,7 +709,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(answer)
         return
 
-    meta = _bot_meta_reply(text)
+    meta = bot_meta_reply(text)
     if meta:
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
@@ -920,7 +720,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(meta)
         return
 
-    if _is_abusive_message(text):
+    if is_abusive_message(text):
         answer = "Давай без оскорблений. Если есть вопрос по колледжу или учёбе, помогу по делу."
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
@@ -931,7 +731,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(answer)
         return
 
-    if _is_smalltalk_message(text):
+    if is_smalltalk_message(text):
         answer = "Могу поболтать коротко, но полезнее — задай вопрос по учёбе или колледжу."
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
@@ -942,7 +742,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(answer)
         return
 
-    direct = _direct_college_reply(text, context.bot_data.get("knowledge", {}))
+    direct = direct_college_reply(text, context.bot_data.get("knowledge", {}))
     if direct:
         if is_repeat_question:
             prefix = _repeat_reminder_prefix(state)
@@ -965,7 +765,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(direct)
         return
 
-    direct_study = _direct_study_reply(text)
+    direct_study = direct_study_reply(text)
     if direct_study:
         if is_repeat_question:
             prefix = _repeat_reminder_prefix(state)
@@ -982,7 +782,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(direct_study)
         return
 
-    if _is_non_college_math(text):
+    if is_non_college_math(text):
         answer = "Я помогаю по колледжу и учёбе. По математике вне контекста колледжа не считаю."
         state["fallback_stage"] = 0
         state["awaiting_clarification"] = False
@@ -1021,13 +821,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     min_conf = context.bot_data["rag_min_confidence"]
     max_ctx = context.bot_data["rag_max_context_blocks"]
     qa_examples = context.bot_data.get("qa_examples", [])
-    topic_hint = _extract_topic_hint(text)
+    topic_hint = extract_topic_hint(text)
     query_for_pipeline = text
     dialog_summary = _dialog_context_snippet(state)
-    if dialog_summary and (state.get("awaiting_clarification", False) or _needs_recent_context(text)):
+    if dialog_summary and (state.get("awaiting_clarification", False) or needs_recent_context(text)):
         query_for_pipeline = f"Контекст диалога: {dialog_summary}\nТекущий вопрос: {query_for_pipeline}"
-    if _needs_recent_context(text) and recent_user_context:
-        anchor = _pick_recent_college_message(recent_user_context)
+    if needs_recent_context(text) and recent_user_context:
+        anchor = pick_recent_college_message(recent_user_context)
         if anchor:
             query_for_pipeline = f"{anchor}. Уточнение студента: {text}."
 
@@ -1048,9 +848,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         suggested = str(state.get("suggested_topic", "")).strip().lower()
         topic_l = topic_hint.lower()
         merge_ok = (
-            (awaiting and bool(prev_q) and _looks_like_college_question(prev_q))
+            (awaiting and bool(prev_q) and looks_like_college_question(prev_q))
             or (suggested and (topic_l in suggested or suggested in topic_l))
-            or (bool(prev_q) and _looks_like_college_question(prev_q))
+            or (bool(prev_q) and looks_like_college_question(prev_q))
         )
         if merge_ok and prev_q:
             query_for_pipeline = f"{prev_q}. Уточнение студента: тема — {topic_hint}."
@@ -1063,7 +863,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif (
         state.get("awaiting_clarification", False)
         and len(text.split()) <= 5
-        and _looks_like_college_question(state.get("last_user_question", ""))
+        and looks_like_college_question(state.get("last_user_question", ""))
     ):
         prev_q = state.get("last_user_question", "")
         query_for_pipeline = f"{prev_q}. Уточнение студента: {text}."
@@ -1179,12 +979,17 @@ def main() -> None:
 
     data = load_knowledge(knowledge_path)
     ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    # Временный единый режим: одна модель для всех этапов.
+    # Совместимость: можно задать одну модель на всё (OLLAMA_MODEL_UNIFIED),
+    # или раздельные модели на этапы пайплайна.
     unified_model = os.environ.get("OLLAMA_MODEL_UNIFIED", "mistral").strip() or "mistral"
-    ollama_model_quick = unified_model
-    ollama_model_explain = unified_model
-    ollama_model_complex = unified_model
-    ollama_review_model = unified_model
+    ollama_model_quick = os.environ.get("OLLAMA_MODEL_QUICK", unified_model).strip() or unified_model
+    ollama_model_explain = (
+        os.environ.get("OLLAMA_MODEL_EXPLAIN", unified_model).strip() or unified_model
+    )
+    ollama_model_complex = (
+        os.environ.get("OLLAMA_MODEL_COMPLEX", unified_model).strip() or unified_model
+    )
+    ollama_review_model = os.environ.get("OLLAMA_MODEL_REVIEW", unified_model).strip() or unified_model
     ollama_embed = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
     try:
@@ -1203,7 +1008,8 @@ def main() -> None:
         rag_ctx_blocks = int(os.environ.get("RAG_MAX_CONTEXT_BLOCKS", "2"))
     except ValueError:
         rag_ctx_blocks = 2
-    rag_ctx_blocks = max(1, min(2, rag_ctx_blocks))
+    # Больше контекстных блоков полезно для multi-intent вопросов, но не даём разрастись бесконечно.
+    rag_ctx_blocks = max(1, min(8, rag_ctx_blocks))
 
     admin_id_raw = os.environ.get("ADMIN_TELEGRAM_ID", "").strip()
     admin_id: int | None = None

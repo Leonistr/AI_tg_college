@@ -18,9 +18,10 @@ from rag import KnowledgeChunk, RAGIndex, ollama_embed_batch
 logger = logging.getLogger(__name__)
 
 SYSTEM_ANSWER = """Ты молодой преподаватель/куратор колледжа для студентов.
-Говори просто, по-человечески, без канцелярита и без «умничания», как свой человек.
+Тон: официально-доброжелательный, живой, немного по-свойски.
+Обращайся к студенту на «ты», но без панибратства, грубости и сленга.
 Пиши только по-русски (кириллица), кратко и строго по вопросу.
-Допустим лёгкий дружелюбный тон, но без панибратства и без грубости.
+Говори просто, без канцелярита и без «умничания».
 
 СТРОГИЕ ПРАВИЛА:
 1) Отвечай только на основе блока "Контекст". Это единственный источник фактов.
@@ -35,7 +36,29 @@ SYSTEM_ANSWER = """Ты молодой преподаватель/куратор
 - Если вопрос про объяснение темы: сначала простое объяснение, потом короткий пример, потом где это применяется.
 - Не используй нумерацию вида "1) ... 2) ...", если пользователь сам не просил список.
 - Если это уточнение к прошлому сообщению, отвечай по сути, без пересказа всей истории диалога.
-- Не пиши длинные абзацы и не отвечай одним словом (кроме "да"/"нет" в очевидных случаях)."""
+- Не пиши длинные абзацы и не отвечай одним словом (кроме "да"/"нет" в очевидных случаях).
+- По возможности заканчивай одним практическим шагом (что сделать дальше/к кому обратиться)."""
+
+SYSTEM_STYLE_REWRITE = """Перепиши ответ в стиле молодого преподавателя колледжа.
+Пиши только по-русски.
+
+Требования к тону:
+- Официально и уважительно, но по-человечески.
+- Допустим лёгкий дружелюбный тон.
+- Обращение к студенту на «ты».
+- Без панибратства, сленга и грубости.
+
+Требования к форме:
+- 1-3 коротких предложения.
+- Без канцелярита (например: «в соответствии с», «осуществляется», «данный»).
+- Без нумерации и без воды.
+- Добавь один практический следующий шаг, если его нет.
+
+КРИТИЧЕСКИ ВАЖНО:
+- Факты не менять.
+- Новые факты не добавлять.
+- Если исходный ответ уже подходит, верни его почти без изменений.
+Верни только итоговый текст ответа, без комментариев."""
 
 SYSTEM_DECOMPOSE = """Раздели сообщение студента на отдельные простые вопросы.
 Верни ТОЛЬКО строки: одна строка = один вопрос.
@@ -150,6 +173,15 @@ EXPLAIN_MARKERS = (
     "почему",
     "зачем",
     "что такое",
+)
+BUREAUCRATIC_PATTERNS = (
+    r"\bв\s+соответствии\s+с\b",
+    r"\bосуществля\w*\b",
+    r"\bданн\w+\s+(вопрос|запрос|процесс|случа\w*)\b",
+    r"\bнеобходимо\b",
+    r"\bтребуется\b",
+    r"\bпредоставляется\b",
+    r"\bпроизводится\b",
 )
 
 SYSTEM_REVIEW = """Ты вторая модель-проверяющий (LLM2). Твоя задача: проверить ответ LLM1.
@@ -421,6 +453,54 @@ async def review_answer(
         return ReviewResult(ok=True, issues=[], fixed_answer="")
 
 
+def _has_practical_step(answer: str) -> bool:
+    low = answer.lower()
+    return any(
+        x in low
+        for x in (
+            "напиши",
+            "обратись",
+            "подойди",
+            "проверь",
+            "уточни",
+            "сообщи",
+            "зайди",
+            "свяжись",
+        )
+    )
+
+
+async def rewrite_answer_style(
+    client: httpx.AsyncClient,
+    base_url: str,
+    model: str,
+    user_prompt: str,
+    context_block: str,
+    answer: str,
+) -> str:
+    style_user_text = (
+        f"Вопрос студента:\n{user_prompt}\n\n"
+        f"Контекст фактов (менять нельзя):\n{context_block}\n\n"
+        f"Текущий ответ:\n{answer}\n\n"
+        "Сделай только стилистическую правку."
+    )
+    try:
+        raw = await ollama_chat(
+            client=client,
+            base_url=base_url,
+            model=model,
+            system=SYSTEM_STYLE_REWRITE,
+            user_text=style_user_text,
+            temperature=0.2,
+            timeout=60.0,
+        )
+        out = raw.strip()
+        return out or answer
+    except Exception:
+        logger.exception("style rewrite failed")
+        return answer
+
+
 async def analyze_user_message(
     client: httpx.AsyncClient,
     base_url: str,
@@ -565,6 +645,12 @@ def _postprocess_answer(text: str, is_complex: bool, wants_full_answer: bool = F
         uniq.append(ln)
     out = " ".join(uniq).strip()
     out = re.sub(r"\s{2,}", " ", out)
+    # Чистим остатки канцелярита после генерации.
+    out = re.sub(r"\bв\s+соответствии\s+с\b", "по", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bданн\w+\s+(вопрос|запрос|процесс|случа\w*)\b", "этот вопрос", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bосуществля\w*\b", "делай", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bпредоставляется\b", "доступно", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out).strip()
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", out) if s.strip()]
     max_sent = 8 if wants_full_answer else 3
     if len(sentences) > max_sent:
@@ -681,7 +767,7 @@ async def answer_with_rag(
     if len(query_embs) != len(analysis.subquestions):
         raise ValueError("Число эмбеддингов запроса не совпало с числом подвопросов")
 
-    max_context_blocks = max(1, min(2, max_context_blocks))
+    max_context_blocks = max(1, min(8, max_context_blocks))
     per_q_best: list[float] = []
     merged_scores: dict[str, float] = {}
     meta: dict[str, tuple[str, str]] = {}
@@ -789,10 +875,28 @@ async def answer_with_rag(
         else:
             answer = FALLBACK_NO_MATCH
 
+    # Этап 4.5: стилизация тона без изменения фактов.
+    answer = await rewrite_answer_style(
+        client=client,
+        base_url=base_url,
+        model=selected_model,
+        user_prompt=q_block,
+        context_block=context_block,
+        answer=answer,
+    )
+    # Если после стилизации потерялся practical next step, мягко добавим.
+    if not _has_practical_step(answer):
+        answer = f"{answer.rstrip()} Если что, напиши куратору или преподавателю."
+
     # Этап 5: пост-обработка
     is_complex = analysis.has_multi_intent or len(analysis.subquestions) > 1 or len(user_message) > 140
     wants_full_answer = _wants_full_answer(user_message)
     out = _postprocess_answer(answer, is_complex=is_complex, wants_full_answer=wants_full_answer)
+    if any(re.search(p, out.lower()) for p in BUREAUCRATIC_PATTERNS):
+        out = re.sub(r"\bнеобходимо\b", "нужно", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bтребуется\b", "нужно", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bпредоставляется\b", "доступно", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s{2,}", " ", out).strip()
     if len(out) > 25 and _cyrillic_letter_ratio(out) < 0.28:
         return FALLBACK_NO_MATCH
     return out

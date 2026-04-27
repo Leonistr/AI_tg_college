@@ -18,6 +18,7 @@ class EvalRow:
     user: str
     bot: str
     expected_keywords: list[str]
+    forbidden_phrases: list[str]
 
 
 def _load_rows(path: Path) -> list[EvalRow]:
@@ -32,6 +33,7 @@ def _load_rows(path: Path) -> list[EvalRow]:
                 user=str(obj.get("user", "")).strip(),
                 bot=str(obj.get("bot", "")).strip(),
                 expected_keywords=[str(x).lower().strip() for x in obj.get("expected_keywords", []) if str(x).strip()],
+                forbidden_phrases=[str(x).lower().strip() for x in obj.get("forbidden_phrases", []) if str(x).strip()],
             )
         )
     return rows
@@ -44,11 +46,13 @@ def _write_sample(path: Path) -> None:
             "user": "где посмотреть оценки",
             "bot": "Оценки смотри в SmartNation: логин — ИИН, пароль — последние 6 цифр ИИН + abc.",
             "expected_keywords": ["smartnation", "иин"],
+            "forbidden_phrases": ["в соответствии с", "данный вопрос", "осуществляется"],
         },
         {
             "user": "как исправить оценку",
             "bot": "По материалам колледжа: по изменению оценки лучше сразу подойти к преподавателю.",
             "expected_keywords": ["преподавател"],
+            "forbidden_phrases": ["в соответствии с", "данный вопрос", "осуществляется"],
         },
     ]
     body = "\n".join(json.dumps(row, ensure_ascii=False) for row in sample) + "\n"
@@ -65,6 +69,20 @@ def _is_hallucination_risk(bot: str) -> bool:
     return any(x in bot.lower() for x in red_flags) and len(bot) > 160
 
 
+def _contains_bureaucratic_phrases(bot: str, forbidden_phrases: list[str]) -> bool:
+    low = bot.lower()
+    defaults = ("в соответствии с", "данный вопрос", "осуществляется", "предоставляется")
+    if any(p in low for p in defaults):
+        return True
+    return any(p in low for p in forbidden_phrases)
+
+
+def _has_practical_step(bot: str) -> bool:
+    low = bot.lower()
+    markers = ("напиши", "обратись", "подойди", "проверь", "уточни", "сообщи", "зайди", "свяжись")
+    return any(m in low for m in markers)
+
+
 def evaluate(rows: list[EvalRow]) -> dict[str, float]:
     if not rows:
         return {"rows": 0}
@@ -72,6 +90,8 @@ def evaluate(rows: list[EvalRow]) -> dict[str, float]:
     listy = 0
     too_long = 0
     hallucination_risk = 0
+    bureaucratic = 0
+    actionable = 0
     for row in rows:
         b = row.bot.lower()
         if row.expected_keywords:
@@ -85,13 +105,21 @@ def evaluate(rows: list[EvalRow]) -> dict[str, float]:
             too_long += 1
         if _is_hallucination_risk(row.bot):
             hallucination_risk += 1
+        if _contains_bureaucratic_phrases(row.bot, row.forbidden_phrases):
+            bureaucratic += 1
+        if _has_practical_step(row.bot):
+            actionable += 1
     total = len(rows)
+    friendly_formal_balance = max(0.0, min(1.0, (actionable / total) - (bureaucratic / total) * 0.6 + 0.5))
     return {
         "rows": float(total),
         "keyword_accuracy": keyword_hits / total,
         "listy_answer_rate": listy / total,
         "too_long_rate": too_long / total,
         "hallucination_risk_rate": hallucination_risk / total,
+        "bureaucratic_phrase_rate": bureaucratic / total,
+        "actionable_ending_rate": actionable / total,
+        "friendly_formal_balance_score": friendly_formal_balance,
     }
 
 

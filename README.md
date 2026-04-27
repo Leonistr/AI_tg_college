@@ -22,9 +22,7 @@ copy .env.example .env
 Скачай модели в Ollama (имена должны совпадать с `.env`):
 
 ```bash
-ollama pull phi3
 ollama pull mistral
-ollama pull llama3
 ollama pull nomic-embed-text
 ```
 
@@ -35,6 +33,17 @@ python bot.py
 ```
 
 В Telegram: `/start`, для админа — `/myid`, `/reload` после правок в markdown.
+
+## Модели и контекст RAG
+
+- Минимально достаточно `OLLAMA_MODEL_UNIFIED` — одна модель на все этапы.
+- Опционально можно включить раздельные модели:
+  - `OLLAMA_MODEL_QUICK`
+  - `OLLAMA_MODEL_EXPLAIN`
+  - `OLLAMA_MODEL_COMPLEX`
+  - `OLLAMA_MODEL_REVIEW`
+- Если раздельные переменные пустые, автоматически используется `OLLAMA_MODEL_UNIFIED`.
+- `RAG_MAX_CONTEXT_BLOCKS` теперь можно настраивать в диапазоне `1..8` (по умолчанию `3` в `.env.example`).
 
 ## Структура
 
