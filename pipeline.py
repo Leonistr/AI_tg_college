@@ -616,6 +616,38 @@ def _lexical_overlap_score(query: str, fact: str) -> float:
     return len(q.intersection(f)) / max(1, len(q))
 
 
+def _quick_answer_from_examples(user_message: str, qa_examples: list[dict] | None) -> str | None:
+    """
+    Быстрый FAQ-путь без Ollama:
+    если вопрос очень похож на уже известный Q/A, возвращаем готовый ответ.
+    Это резко снижает задержку на слабых машинах.
+    """
+    if not qa_examples:
+        return None
+    q = user_message.strip()
+    if not q:
+        return None
+    q_low = q.lower()
+    best_score = 0.0
+    best_answer: str | None = None
+    for ex in qa_examples:
+        ex_q = str(ex.get("q", "")).strip()
+        ex_a = str(ex.get("a", "")).strip()
+        if not ex_q or not ex_a:
+            continue
+        ex_q_low = ex_q.lower()
+        score = _lexical_overlap_score(q_low, ex_q_low)
+        # Бонус за вхождение ключевой фразы.
+        if q_low in ex_q_low or ex_q_low in q_low:
+            score += 0.22
+        if score > best_score:
+            best_score = score
+            best_answer = ex_a
+    if best_answer and best_score >= 0.52:
+        return best_answer
+    return None
+
+
 def _pick_best_context_blocks(
     scored_chunks: list[tuple[str, str, str, float]],
     topics: list[str],
@@ -764,6 +796,16 @@ async def answer_with_rag(
 
     def _time_left(total_budget_sec: float = 55.0) -> float:
         return max(5.0, total_budget_sec - _elapsed())
+
+    # Этап 0: быстрый ответ по FAQ-примерам (без обращения к моделям).
+    fast_example_answer = _quick_answer_from_examples(user_message, qa_examples)
+    if fast_example_answer:
+        is_complex = len(user_message) > 140
+        wants_full_answer = _wants_full_answer(user_message)
+        out = _postprocess_answer(fast_example_answer, is_complex=is_complex, wants_full_answer=wants_full_answer)
+        if not _has_practical_step(out):
+            out = f"{out.rstrip()} Если нужно, уточни детали — помогу."
+        return out
 
     # Для анализа/классификации используем "объясняющую" модель как дефолт.
     analyzer_model = explain_model
